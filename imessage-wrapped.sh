@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║            iMessage Wrapped 2025 - Universal Generator                     ║
+# ║            iMessage Wrapped - Universal Generator                          ║
 # ║            Generate a Spotify Wrapped-style HTML for:                      ║
 # ║            - Individual contacts                                           ║
 # ║            - Group chats                                                   ║
@@ -25,12 +25,22 @@ NC='\033[0m'
 IMESSAGE_DB="$HOME/Library/Messages/chat.db"
 ADDRESSBOOK_DB=$(find "$HOME/Library/Application Support/AddressBook" -name "AddressBook-v22.abcddb" 2>/dev/null | head -1)
 
-# Apple timestamps for 2025
-START_2025=757382400
-END_2025=788918400
-
-# Default year
+# Default year (can be overridden with --year)
 YEAR=2025
+
+# Function to calculate Apple timestamps for a given year
+# Apple's epoch is 2001-01-01 00:00:00 UTC
+calculate_timestamps() {
+    local year=$1
+    # Calculate seconds from Unix epoch (1970) to Apple epoch (2001)
+    local apple_epoch_offset=978307200
+    # Calculate start of year in Unix time, then convert to Apple time
+    START_TIMESTAMP=$(date -j -f "%Y-%m-%d %H:%M:%S" "$year-01-01 00:00:00" "+%s" 2>/dev/null)
+    END_TIMESTAMP=$(date -j -f "%Y-%m-%d %H:%M:%S" "$((year + 1))-01-01 00:00:00" "+%s" 2>/dev/null)
+    # Convert to Apple timestamps
+    START_YEAR=$((START_TIMESTAMP - apple_epoch_offset))
+    END_YEAR=$((END_TIMESTAMP - apple_epoch_offset))
+}
 
 usage() {
     echo ""
@@ -48,6 +58,7 @@ usage() {
     echo "  -o, --output FILE    Output HTML file"
     echo "  -n, --name NAME      Display name for the contact/group"
     echo "  -y, --your-name NAME Your name to display (default: 'You')"
+    echo "  --year YEAR          Year to generate wrapped for (default: 2025)"
     echo "  --list-groups        List all group chats"
     echo "  --list-contacts      List top contacts by message count"
     echo "  -h, --help           Show this help message"
@@ -58,6 +69,7 @@ usage() {
     echo "  $0 --group 'movie club'              # Group chat (fuzzy match)"
     echo "  $0 --group 'rowers' -n 'Austin Rowers'"
     echo "  $0 --all                             # All messages wrapped"
+    echo "  $0 --year 2024 --all                 # All messages from 2024"
     echo "  $0 --list-groups                     # See all group chats"
     echo ""
     exit 1
@@ -103,6 +115,10 @@ while [[ $# -gt 0 ]]; do
             LIST_CONTACTS=true
             shift
             ;;
+        --year)
+            YEAR="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -116,6 +132,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Calculate timestamps for the selected year
+calculate_timestamps $YEAR
 
 # Check if database exists
 if [ ! -f "$IMESSAGE_DB" ]; then
@@ -194,7 +213,7 @@ get_contact_name() {
 
 if [ "$LIST_GROUPS" = true ]; then
     echo ""
-    echo -e "${CYAN}${BOLD}Group Chats in 2025:${NC}"
+    echo -e "${CYAN}${BOLD}Group Chats in $YEAR:${NC}"
     echo -e "${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
     sqlite3 "$IMESSAGE_DB" "
@@ -206,8 +225,8 @@ if [ "$LIST_GROUPS" = true ]; then
         JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
         JOIN message m ON cmj.message_id = m.ROWID
         WHERE c.chat_identifier LIKE 'chat%'
-          AND m.date/1000000000 >= $START_2025
-          AND m.date/1000000000 < $END_2025
+          AND m.date/1000000000 >= $START_YEAR
+          AND m.date/1000000000 < $END_YEAR
         GROUP BY c.chat_identifier
         HAVING cnt > 10
         ORDER BY cnt DESC
@@ -227,7 +246,7 @@ fi
 
 if [ "$LIST_CONTACTS" = true ]; then
     echo ""
-    echo -e "${CYAN}${BOLD}Top Contacts in 2025:${NC}"
+    echo -e "${CYAN}${BOLD}Top Contacts in $YEAR:${NC}"
     echo -e "${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
     sqlite3 "$IMESSAGE_DB" "
@@ -236,8 +255,8 @@ if [ "$LIST_CONTACTS" = true ]; then
             COUNT(m.ROWID) as cnt
         FROM handle h
         JOIN message m ON m.handle_id = h.ROWID
-        WHERE m.date/1000000000 >= $START_2025
-          AND m.date/1000000000 < $END_2025
+        WHERE m.date/1000000000 >= $START_YEAR
+          AND m.date/1000000000 < $END_YEAR
         GROUP BY h.id
         HAVING cnt > 50
         ORDER BY cnt DESC
@@ -260,7 +279,7 @@ TITLE=""
 
 if [ "$MODE" = "all" ]; then
     echo -e "${CYAN}${BOLD}Generating wrapped for ALL your messages!${NC}"
-    WHERE_CLAUSE="m.date/1000000000 >= $START_2025 AND m.date/1000000000 < $END_2025"
+    WHERE_CLAUSE="m.date/1000000000 >= $START_YEAR AND m.date/1000000000 < $END_YEAR"
     TITLE="Your iMessage"
     CONTACT_NAME="${CONTACT_NAME:-Everyone}"
     OUTPUT_FILE="${OUTPUT_FILE:-imessage-wrapped-${YEAR}.html}"
@@ -283,8 +302,8 @@ elif [ "$MODE" = "group" ]; then
         JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
         JOIN message m ON cmj.message_id = m.ROWID
         WHERE c.chat_identifier LIKE 'chat%'
-          AND m.date/1000000000 >= $START_2025
-          AND m.date/1000000000 < $END_2025
+          AND m.date/1000000000 >= $START_YEAR
+          AND m.date/1000000000 < $END_YEAR
           AND (LOWER(c.display_name) LIKE '%$(echo "$TARGET" | tr '[:upper:]' '[:lower:]')%'
                OR LOWER(c.chat_identifier) LIKE '%$(echo "$TARGET" | tr '[:upper:]' '[:lower:]')%')
         GROUP BY c.chat_identifier
@@ -314,7 +333,7 @@ elif [ "$MODE" = "group" ]; then
 
     echo -e "${GREEN}Found: ${DISPLAY_NAME:-$CHAT_ID}${NC}"
 
-    WHERE_CLAUSE="c.chat_identifier = '$CHAT_ID' AND m.date/1000000000 >= $START_2025 AND m.date/1000000000 < $END_2025"
+    WHERE_CLAUSE="c.chat_identifier = '$CHAT_ID' AND m.date/1000000000 >= $START_YEAR AND m.date/1000000000 < $END_YEAR"
     TITLE="${CONTACT_NAME:-${DISPLAY_NAME:-Group Chat}}"
     CONTACT_NAME="${CONTACT_NAME:-${DISPLAY_NAME:-Group Chat}}"
 
@@ -365,7 +384,7 @@ else
         CONTACT_NAME=$(get_contact_name "$FIRST_HANDLE")
     fi
 
-    WHERE_CLAUSE="h.id IN ($HANDLE_SQL) AND m.date/1000000000 >= $START_2025 AND m.date/1000000000 < $END_2025"
+    WHERE_CLAUSE="h.id IN ($HANDLE_SQL) AND m.date/1000000000 >= $START_YEAR AND m.date/1000000000 < $END_YEAR"
     TITLE="$YOUR_NAME & $CONTACT_NAME"
 
     SAFE_NAME=$(echo "$CONTACT_NAME" | tr ' ' '-' | tr -cd '[:alnum:]-' | tr '[:upper:]' '[:lower:]')
@@ -394,7 +413,7 @@ fi
 TOTAL_MESSAGES=$(sqlite3 "$IMESSAGE_DB" "SELECT COUNT(*) $BASE_FROM WHERE $WHERE_CLAUSE;")
 
 if [ "$TOTAL_MESSAGES" -eq 0 ]; then
-    echo -e "${RED}No messages found for this target in 2025!${NC}"
+    echo -e "${RED}No messages found for this target in $YEAR!${NC}"
     exit 1
 fi
 

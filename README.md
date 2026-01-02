@@ -71,6 +71,7 @@ chmod +x imessage-wrapped.sh
 | `-o, --output FILE` | Specify output HTML filename |
 | `-n, --name NAME` | Display name for the contact/group |
 | `-y, --your-name NAME` | Your name to display (default: 'You') |
+| `--year YEAR` | Year to generate wrapped for (default: 2025) |
 | `--group <name>` | Generate wrapped for a group chat |
 | `--all` | Generate wrapped for all messages |
 | `--list-groups` | List all group chats with message counts |
@@ -88,6 +89,10 @@ chmod +x imessage-wrapped.sh
 
 # Your entire iMessage year
 ./imessage-wrapped.sh --all -y 'Joshua'
+
+# Generate wrapped for a different year
+./imessage-wrapped.sh --year 2024 --all
+./imessage-wrapped.sh --year 2023 -n 'Helen' '+15551234567'
 ```
 
 ## Output
