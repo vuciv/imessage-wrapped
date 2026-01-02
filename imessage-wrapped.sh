@@ -388,7 +388,8 @@ else
     TITLE="$YOUR_NAME & $CONTACT_NAME"
 
     SAFE_NAME=$(echo "$CONTACT_NAME" | tr ' ' '-' | tr -cd '[:alnum:]-' | tr '[:upper:]' '[:lower:]')
-    OUTPUT_FILE="${OUTPUT_FILE:-${YOUR_NAME,,}-${SAFE_NAME}-wrapped-${YEAR}.html}"
+    YOUR_NAME_LOWER=$(echo "$YOUR_NAME" | tr '[:upper:]' '[:lower:]')
+    OUTPUT_FILE="${OUTPUT_FILE:-${YOUR_NAME_LOWER}-${SAFE_NAME}-wrapped-${YEAR}.html}"
 fi
 
 echo -e "${CYAN}${BOLD}Generating wrapped for: $TITLE${NC}"
