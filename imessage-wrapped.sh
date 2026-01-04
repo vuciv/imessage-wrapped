@@ -59,6 +59,7 @@ usage() {
     echo "  -n, --name NAME      Display name for the contact/group"
     echo "  -y, --your-name NAME Your name to display (default: 'You')"
     echo "  --year YEAR          Year to generate wrapped for (default: 2025)"
+    echo "  --privacy            Hide phone numbers/emails (use first names only)"
     echo "  --list-groups        List all group chats"
     echo "  --list-contacts      List top contacts by message count"
     echo "  -h, --help           Show this help message"
@@ -83,6 +84,7 @@ TARGET=""
 MODE="individual"  # individual, group, all
 LIST_GROUPS=false
 LIST_CONTACTS=false
+PRIVACY_MODE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -118,6 +120,10 @@ while [[ $# -gt 0 ]]; do
         --year)
             YEAR="$2"
             shift 2
+            ;;
+        --privacy)
+            PRIVACY_MODE=true
+            shift
             ;;
         -h|--help)
             usage
@@ -156,7 +162,6 @@ fi
 
 # Create temp files
 CONTACT_CACHE=$(mktemp)
-trap "rm -f $CONTACT_CACHE" EXIT
 
 # Build contact lookup
 echo -e "${DIM}Building contact lookup...${NC}"
@@ -180,6 +185,12 @@ if [ -n "$ADDRESSBOOK_DB" ]; then
     done > "$CONTACT_CACHE"
 fi
 
+# Temp file for anonymous user mapping in privacy mode
+ANON_MAP_FILE=$(mktemp)
+ANON_COUNTER_FILE=$(mktemp)
+echo "0" > "$ANON_COUNTER_FILE"
+trap "rm -f $CONTACT_CACHE $ANON_MAP_FILE $ANON_COUNTER_FILE" EXIT
+
 # Function to get contact name from handle
 get_contact_name() {
     local handle="$1"
@@ -196,13 +207,32 @@ get_contact_name() {
     fi
 
     if [ -n "$match" ] && [ "$match" != " " ]; then
-        echo "$match"
-    else
-        # Return truncated handle
-        if [ ${#handle} -gt 15 ]; then
-            echo "...${handle: -10}"
+        if [ "$PRIVACY_MODE" = true ]; then
+            # Return only first name in privacy mode
+            echo "$match" | awk '{print $1}'
         else
-            echo "$handle"
+            echo "$match"
+        fi
+    else
+        if [ "$PRIVACY_MODE" = true ]; then
+            # Return consistent anonymous name for each handle using temp file
+            local existing=$(grep "^${handle}|" "$ANON_MAP_FILE" 2>/dev/null | cut -d'|' -f2)
+            if [ -n "$existing" ]; then
+                echo "$existing"
+            else
+                local counter=$(cat "$ANON_COUNTER_FILE")
+                counter=$((counter + 1))
+                echo "$counter" > "$ANON_COUNTER_FILE"
+                echo "${handle}|Friend ${counter}" >> "$ANON_MAP_FILE"
+                echo "Friend ${counter}"
+            fi
+        else
+            # Return truncated handle
+            if [ ${#handle} -gt 15 ]; then
+                echo "...${handle: -10}"
+            else
+                echo "$handle"
+            fi
         fi
     fi
 }
@@ -393,6 +423,9 @@ else
 fi
 
 echo -e "${CYAN}${BOLD}Generating wrapped for: $TITLE${NC}"
+if [ "$PRIVACY_MODE" = true ]; then
+    echo -e "${YELLOW}Privacy mode enabled - phone numbers and last names will be hidden${NC}"
+fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -538,6 +571,33 @@ if [ "$MODE" = "group" ] || [ "$MODE" = "all" ]; then
     ")
 fi
 
+# Top laugh react receivers (for group mode)
+if [ "$MODE" = "group" ]; then
+    # Find who received the most laugh reacts
+    # Laugh reacts have associated_message_type = 2003
+    # The associated_message_guid has prefixes like "p:0/" or "bp:" that need to be stripped
+    TOP_LAUGH_RECEIVERS=$(sqlite3 "$IMESSAGE_DB" "
+        SELECT
+            CASE WHEN orig.is_from_me = 1 THEN 'YOU' ELSE h.id END as person,
+            COUNT(*) as cnt
+        FROM message m
+        JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+        JOIN chat c ON cmj.chat_id = c.ROWID
+        JOIN message orig ON orig.guid = SUBSTR(m.associated_message_guid, INSTR(m.associated_message_guid, ':') + 3)
+                          OR orig.guid = SUBSTR(m.associated_message_guid, INSTR(m.associated_message_guid, ':') + 1)
+                          OR orig.guid = m.associated_message_guid
+        LEFT JOIN handle h ON orig.handle_id = h.ROWID
+        WHERE c.chat_identifier = '$CHAT_ID'
+          AND m.date/1000000000 >= $START_YEAR
+          AND m.date/1000000000 < $END_YEAR
+          AND m.associated_message_type = 2003
+        GROUP BY person
+        ORDER BY cnt DESC
+        LIMIT 5;
+    ")
+
+fi
+
 # Sample messages
 SWEET_MESSAGES=$(sqlite3 "$IMESSAGE_DB" "
     SELECT
@@ -570,11 +630,13 @@ RANDOM_MESSAGES=$(sqlite3 "$IMESSAGE_DB" "
 
 # Word counts
 TOTAL_WORDS=$(sqlite3 "$IMESSAGE_DB" "
-    SELECT SUM(LENGTH(m.text) - LENGTH(REPLACE(m.text, ' ', '')) + 1)
+    SELECT COALESCE(SUM(LENGTH(m.text) - LENGTH(REPLACE(m.text, ' ', '')) + 1), 0)
     $BASE_FROM
-    WHERE $WHERE_CLAUSE AND m.text IS NOT NULL;
+    WHERE $WHERE_CLAUSE AND m.text IS NOT NULL AND LENGTH(m.text) > 0;
 ")
 TOTAL_WORDS=${TOTAL_WORDS:-0}
+# Handle empty result
+[ -z "$TOTAL_WORDS" ] && TOTAL_WORDS=0
 
 # Photo count (attachments)
 PHOTO_COUNT=$(sqlite3 "$IMESSAGE_DB" "
@@ -814,7 +876,7 @@ if [ "$MODE" = "group" ] || [ "$MODE" = "all" ]; then
     while IFS='|' read -r person count; do
         if [ -n "$person" ]; then
             if [ "$person" = "YOU" ]; then
-                NAME_HTML="<strong style=\"color: #4cc9f0;\">YOU</strong>"
+                NAME_HTML="<strong style=\"color: var(--apple-blue);\">You</strong>"
             else
                 NAME=$(get_contact_name "$person")
                 NAME_HTML="$NAME"
@@ -842,143 +904,633 @@ cat > "$OUTPUT_FILE" << 'HTMLEOF'
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TITLE_PLACEHOLDER</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --apple-black: #1d1d1f;
+            --apple-gray: #86868b;
+            --apple-light: #f5f5f7;
+            --apple-blue: #0071e3;
+            --apple-green: #34c759;
+            --apple-pink: #ff2d55;
+            --apple-purple: #af52de;
+            --apple-orange: #ff9500;
+            --apple-teal: #5ac8fa;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Outfit', sans-serif; background: #0a0a0a; color: white; overflow: hidden; height: 100vh; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', sans-serif;
+            background: #000;
+            color: white;
+            overflow: hidden;
+            height: 100vh;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
         .wrapped-container { height: 100vh; width: 100vw; position: relative; }
-        .slide { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 40px; opacity: 0; transform: scale(0.9); transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1); pointer-events: none; }
-        .slide.active { opacity: 1; transform: scale(1); pointer-events: all; }
 
-        .slide-intro { background: linear-gradient(135deg, #1a1a2e 0%, #2d1b4e 50%, #4a1942 100%); }
-        .slide-total { background: linear-gradient(135deg, #ff6b6b 0%, #ee5a5a 50%, #c94b4b 100%); }
-        .slide-balance { background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%); color: #333; }
-        .slide-daily { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-        .slide-peak { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
-        .slide-reactions { background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); }
-        .slide-late-night { background: linear-gradient(135deg, #0c1445 0%, #1a1b4b 50%, #2d1b4e 100%); }
-        .slide-sweet { background: linear-gradient(135deg, #ffafbd 0%, #ffc3a0 100%); color: #333; }
-        .slide-random { background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); color: #333; }
-        .slide-busiest { background: linear-gradient(135deg, #fc4a1a 0%, #f7b733 100%); }
-        .slide-months { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
-        .slide-day { background: linear-gradient(135deg, #7209b7 0%, #560bad 100%); }
-        .slide-leaderboard { background: linear-gradient(135deg, #f72585 0%, #b5179e 100%); }
-        .slide-stats { background: linear-gradient(135deg, #00b4d8 0%, #0096c7 100%); }
-        .slide-finale { background: linear-gradient(135deg, #ff6b6b 0%, #ee5a5a 30%, #f093fb 70%, #667eea 100%); }
+        .slide {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 60px 40px;
+            opacity: 0;
+            transform: translateY(20px);
+            transition: opacity 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94), transform 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            pointer-events: none;
+            background: #000;
+        }
 
-        .pre-title { font-size: 1.2rem; opacity: 0.8; text-transform: uppercase; letter-spacing: 3px; margin-bottom: 20px; }
-        .big-number { font-size: clamp(4rem, 15vw, 10rem); font-weight: 900; line-height: 1; text-shadow: 0 10px 30px rgba(0,0,0,0.3); }
-        .stat-label { font-size: 1.5rem; opacity: 0.9; margin-top: 10px; }
-        .subtitle { font-size: 1.1rem; opacity: 0.7; margin-top: 30px; max-width: 450px; text-align: center; line-height: 1.5; }
-        .title { font-size: clamp(2rem, 8vw, 4rem); font-weight: 900; text-align: center; margin-bottom: 20px; }
+        .slide.active {
+            opacity: 1;
+            transform: translateY(0);
+            pointer-events: all;
+        }
 
-        .message-card { background: rgba(255,255,255,0.95); border-radius: 20px; padding: 25px 30px; margin: 12px 0; max-width: 500px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); animation: popIn 0.5s ease forwards; opacity: 0; }
-        .message-card:nth-child(1) { animation-delay: 0.2s; }
-        .message-card:nth-child(2) { animation-delay: 0.4s; }
-        .message-card:nth-child(3) { animation-delay: 0.6s; }
-        @keyframes popIn { from { opacity: 0; transform: scale(0.8) translateY(20px); } to { opacity: 1; transform: scale(1) translateY(0); } }
-        .message-sender { font-weight: 700; margin-bottom: 8px; }
-        .message-sender.you { color: #667eea; }
-        .message-sender.them { color: #f5576c; }
-        .message-text { font-size: 1.1rem; color: #333; line-height: 1.4; }
+        /* Apple-style gradient backgrounds */
+        .slide-intro {
+            background: radial-gradient(ellipse at top, #1a1a2e 0%, #000 70%);
+        }
+        .slide-total {
+            background: linear-gradient(180deg, #000 0%, #1a0a0a 100%);
+        }
+        .slide-balance {
+            background: linear-gradient(180deg, #000 0%, #0a0a1a 100%);
+            color: white;
+        }
+        .slide-daily {
+            background: linear-gradient(180deg, #000 0%, #0a0a15 100%);
+        }
+        .slide-peak {
+            background: linear-gradient(180deg, #000 0%, #150a15 100%);
+        }
+        .slide-reactions {
+            background: linear-gradient(180deg, #000 0%, #151005 100%);
+        }
+        .slide-late-night {
+            background: radial-gradient(ellipse at bottom, #0a0a20 0%, #000 70%);
+        }
+        .slide-sweet {
+            background: linear-gradient(180deg, #000 0%, #150a0a 100%);
+            color: white;
+        }
+        .slide-random {
+            background: linear-gradient(180deg, #000 0%, #0a150a 100%);
+            color: white;
+        }
+        .slide-busiest {
+            background: linear-gradient(180deg, #000 0%, #151008 100%);
+        }
+        .slide-months {
+            background: linear-gradient(180deg, #000 0%, #051015 100%);
+        }
+        .slide-day {
+            background: linear-gradient(180deg, #000 0%, #100515 100%);
+        }
+        .slide-leaderboard {
+            background: linear-gradient(180deg, #000 0%, #150510 100%);
+        }
+        .slide-stats {
+            background: linear-gradient(180deg, #000 0%, #051010 100%);
+        }
+        .slide-finale {
+            background: radial-gradient(ellipse at center, #1a1020 0%, #000 70%);
+        }
 
-        .reactions-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 30px; max-width: 400px; }
-        .reaction-item { text-align: center; animation: bounceIn 0.5s ease forwards; opacity: 0; }
-        .reaction-item:nth-child(1) { animation-delay: 0.1s; }
-        .reaction-item:nth-child(2) { animation-delay: 0.2s; }
-        .reaction-item:nth-child(3) { animation-delay: 0.3s; }
-        .reaction-item:nth-child(4) { animation-delay: 0.4s; }
-        .reaction-item:nth-child(5) { animation-delay: 0.5s; }
-        .reaction-item:nth-child(6) { animation-delay: 0.6s; }
-        @keyframes bounceIn { 0% { opacity: 0; transform: scale(0); } 60% { transform: scale(1.2); } 100% { opacity: 1; transform: scale(1); } }
-        .reaction-emoji { font-size: 3rem; display: block; margin-bottom: 5px; }
-        .reaction-count { font-size: 1.2rem; font-weight: 700; }
+        /* Typography */
+        .pre-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 12px;
+        }
 
-        .nav-dots { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; z-index: 100; }
-        .nav-dot { width: 10px; height: 10px; border-radius: 50%; background: rgba(255,255,255,0.3); cursor: pointer; transition: all 0.3s ease; }
-        .nav-dot.active { background: white; transform: scale(1.3); }
-        .nav-arrows { position: fixed; bottom: 30px; right: 30px; display: flex; gap: 15px; z-index: 100; }
-        .nav-arrow { width: 50px; height: 50px; border-radius: 50%; background: rgba(255,255,255,0.2); border: none; color: white; font-size: 1.5rem; cursor: pointer; transition: all 0.3s ease; display: flex; align-items: center; justify-content: center; }
-        .nav-arrow:hover { background: rgba(255,255,255,0.4); transform: scale(1.1); }
+        .big-number {
+            font-size: clamp(5rem, 20vw, 12rem);
+            font-weight: 700;
+            line-height: 1;
+            letter-spacing: -0.03em;
+            background: linear-gradient(180deg, #fff 0%, rgba(255,255,255,0.8) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
 
-        .intro-logo { font-size: 5rem; margin-bottom: 20px; animation: pulse 2s ease-in-out infinite; }
-        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
-        .click-hint { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%); font-size: 0.9rem; opacity: 0.6; animation: bounce 2s ease-in-out infinite; }
-        @keyframes bounce { 0%, 100% { transform: translateX(-50%) translateY(0); } 50% { transform: translateX(-50%) translateY(-10px); } }
+        .stat-label {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--apple-gray);
+            margin-top: 8px;
+            letter-spacing: -0.01em;
+        }
 
-        .balance-bar { display: flex; width: 100%; max-width: 400px; height: 60px; border-radius: 30px; overflow: hidden; margin: 30px 0; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
-        .balance-you { background: linear-gradient(90deg, #667eea, #764ba2); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1rem; color: white; padding: 0 10px; }
-        .balance-them { background: linear-gradient(90deg, #f5576c, #f093fb); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1rem; color: white; padding: 0 10px; }
+        .subtitle {
+            font-size: 1.125rem;
+            font-weight: 400;
+            color: var(--apple-gray);
+            margin-top: 40px;
+            max-width: 500px;
+            text-align: center;
+            line-height: 1.5;
+        }
 
-        .chart-container { display: flex; align-items: flex-end; gap: 6px; height: 180px; margin-top: 30px; max-width: 100%; }
-        .chart-bar { flex: 1; background: rgba(255,255,255,0.9); border-radius: 8px 8px 0 0; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; padding: 6px 3px; min-width: 28px; animation: growUp 0.8s ease forwards; transform-origin: bottom; }
-        @keyframes growUp { from { transform: scaleY(0); } to { transform: scaleY(1); } }
-        .chart-label { font-size: 0.65rem; font-weight: 600; color: #333; margin-top: 5px; }
-        .chart-value { font-size: 0.65rem; font-weight: 700; color: #333; }
+        .title {
+            font-size: clamp(2.5rem, 8vw, 4.5rem);
+            font-weight: 700;
+            text-align: center;
+            margin-bottom: 8px;
+            letter-spacing: -0.03em;
+            background: linear-gradient(180deg, #fff 0%, rgba(255,255,255,0.85) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
 
-        .stat-row { display: flex; justify-content: space-around; width: 100%; max-width: 600px; margin-top: 40px; flex-wrap: wrap; gap: 20px; }
-        .mini-stat { text-align: center; min-width: 100px; }
-        .mini-stat-value { font-size: 2.2rem; font-weight: 900; }
-        .mini-stat-label { font-size: 0.85rem; opacity: 0.8; }
+        /* Message Cards - Frosted Glass */
+        .message-card {
+            background: rgba(255,255,255,0.08);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 18px;
+            padding: 20px 24px;
+            margin: 10px 0;
+            max-width: 440px;
+            width: 100%;
+            animation: fadeUp 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+            opacity: 0;
+        }
+        .message-card:nth-child(1) { animation-delay: 0.1s; }
+        .message-card:nth-child(2) { animation-delay: 0.2s; }
+        .message-card:nth-child(3) { animation-delay: 0.3s; }
 
-        .glow { text-shadow: 0 0 20px rgba(255,255,255,0.5), 0 0 40px rgba(255,255,255,0.3); }
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
 
-        .vs-container { display: flex; align-items: center; gap: 30px; margin: 30px 0; }
+        .message-sender {
+            font-weight: 600;
+            font-size: 0.8125rem;
+            margin-bottom: 6px;
+            letter-spacing: -0.01em;
+        }
+        .message-sender.you { color: var(--apple-blue); }
+        .message-sender.them { color: var(--apple-pink); }
+
+        .message-text {
+            font-size: 1rem;
+            color: rgba(255,255,255,0.9);
+            line-height: 1.5;
+            font-weight: 400;
+        }
+
+        /* Reactions Grid */
+        .reactions-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+            margin-top: 40px;
+            max-width: 360px;
+        }
+
+        .reaction-item {
+            text-align: center;
+            animation: scaleIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+            opacity: 0;
+        }
+        .reaction-item:nth-child(1) { animation-delay: 0.05s; }
+        .reaction-item:nth-child(2) { animation-delay: 0.1s; }
+        .reaction-item:nth-child(3) { animation-delay: 0.15s; }
+        .reaction-item:nth-child(4) { animation-delay: 0.2s; }
+        .reaction-item:nth-child(5) { animation-delay: 0.25s; }
+        .reaction-item:nth-child(6) { animation-delay: 0.3s; }
+
+        @keyframes scaleIn {
+            from { opacity: 0; transform: scale(0.5); }
+            to { opacity: 1; transform: scale(1); }
+        }
+
+        .reaction-emoji {
+            font-size: 2.5rem;
+            display: block;
+            margin-bottom: 8px;
+        }
+
+        .reaction-count {
+            font-size: 1.125rem;
+            font-weight: 600;
+            color: rgba(255,255,255,0.9);
+        }
+
+        /* Navigation */
+        .nav-dots {
+            position: fixed;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 8px;
+            z-index: 100;
+            padding: 10px 16px;
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 20px;
+        }
+
+        .nav-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.3);
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .nav-dot.active {
+            background: white;
+            transform: scale(1.2);
+        }
+
+        .nav-dot:hover {
+            background: rgba(255,255,255,0.6);
+        }
+
+        .nav-arrows {
+            position: fixed;
+            bottom: 40px;
+            right: 40px;
+            display: flex;
+            gap: 12px;
+            z-index: 100;
+        }
+
+        .nav-arrow {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: white;
+            font-size: 1.25rem;
+            cursor: pointer;
+            transition: all 0.25s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .nav-arrow:hover {
+            background: rgba(255,255,255,0.2);
+            transform: scale(1.05);
+        }
+
+        /* Intro */
+        .intro-logo {
+            font-size: 4rem;
+            margin-bottom: 24px;
+        }
+
+        .click-hint {
+            position: fixed;
+            bottom: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.8125rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+            animation: fadeInOut 3s ease-in-out infinite;
+        }
+
+        @keyframes fadeInOut {
+            0%, 100% { opacity: 0.4; }
+            50% { opacity: 0.8; }
+        }
+
+        /* Balance Bar */
+        .balance-bar {
+            display: flex;
+            width: 100%;
+            max-width: 400px;
+            height: 56px;
+            border-radius: 28px;
+            overflow: hidden;
+            margin: 32px 0;
+            background: rgba(255,255,255,0.05);
+        }
+
+        .balance-you {
+            background: var(--apple-blue);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: white;
+            padding: 0 16px;
+            transition: width 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .balance-them {
+            background: var(--apple-pink);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: white;
+            padding: 0 16px;
+        }
+
+        /* Chart */
+        .chart-container {
+            display: flex;
+            align-items: flex-end;
+            gap: 8px;
+            height: 200px;
+            margin-top: 40px;
+            padding: 0 20px;
+        }
+
+        .chart-bar {
+            flex: 1;
+            background: linear-gradient(180deg, var(--apple-blue) 0%, rgba(0,113,227,0.6) 100%);
+            border-radius: 6px 6px 0 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            padding-top: 8px;
+            min-width: 24px;
+            max-width: 40px;
+            animation: growUp 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+            transform-origin: bottom;
+            transform: scaleY(0);
+        }
+
+        .chart-bar:nth-child(1) { animation-delay: 0.05s; }
+        .chart-bar:nth-child(2) { animation-delay: 0.1s; }
+        .chart-bar:nth-child(3) { animation-delay: 0.15s; }
+        .chart-bar:nth-child(4) { animation-delay: 0.2s; }
+        .chart-bar:nth-child(5) { animation-delay: 0.25s; }
+        .chart-bar:nth-child(6) { animation-delay: 0.3s; }
+        .chart-bar:nth-child(7) { animation-delay: 0.35s; }
+        .chart-bar:nth-child(8) { animation-delay: 0.4s; }
+        .chart-bar:nth-child(9) { animation-delay: 0.45s; }
+        .chart-bar:nth-child(10) { animation-delay: 0.5s; }
+        .chart-bar:nth-child(11) { animation-delay: 0.55s; }
+        .chart-bar:nth-child(12) { animation-delay: 0.6s; }
+
+        @keyframes growUp {
+            from { transform: scaleY(0); }
+            to { transform: scaleY(1); }
+        }
+
+        .chart-label {
+            font-size: 0.6875rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+            margin-top: 12px;
+            position: absolute;
+            bottom: -24px;
+        }
+
+        .chart-value {
+            font-size: 0.625rem;
+            font-weight: 600;
+            color: white;
+            opacity: 0.9;
+        }
+
+        .chart-bar-wrapper {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            flex: 1;
+        }
+
+        /* Stats Row */
+        .stat-row {
+            display: flex;
+            justify-content: center;
+            gap: 48px;
+            width: 100%;
+            max-width: 600px;
+            margin-top: 48px;
+        }
+
+        .mini-stat {
+            text-align: center;
+        }
+
+        .mini-stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(180deg, #fff 0%, rgba(255,255,255,0.8) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .mini-stat-label {
+            font-size: 0.8125rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+            margin-top: 4px;
+        }
+
+        /* VS Container */
+        .vs-container {
+            display: flex;
+            align-items: center;
+            gap: 48px;
+            margin: 40px 0;
+        }
+
         .vs-person { text-align: center; }
-        .vs-name { font-size: 1.5rem; font-weight: 700; margin-bottom: 10px; }
-        .vs-count { font-size: 3rem; font-weight: 900; }
-        .vs-divider { font-size: 2rem; opacity: 0.5; }
 
-        .leaderboard { width: 100%; max-width: 450px; margin-top: 20px; }
-        .leaderboard-item { display: flex; align-items: center; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.2); animation: slideIn 0.5s ease forwards; opacity: 0; }
-        .leaderboard-item:nth-child(1) { animation-delay: 0.1s; }
-        .leaderboard-item:nth-child(2) { animation-delay: 0.15s; }
-        .leaderboard-item:nth-child(3) { animation-delay: 0.2s; }
-        .leaderboard-item:nth-child(4) { animation-delay: 0.25s; }
-        .leaderboard-item:nth-child(5) { animation-delay: 0.3s; }
-        .leaderboard-item:nth-child(6) { animation-delay: 0.35s; }
-        .leaderboard-item:nth-child(7) { animation-delay: 0.4s; }
-        .leaderboard-item:nth-child(8) { animation-delay: 0.45s; }
-        @keyframes slideIn { from { opacity: 0; transform: translateX(-30px); } to { opacity: 1; transform: translateX(0); } }
-        .rank { font-size: 1.5rem; font-weight: 700; width: 45px; }
-        .rank-name { flex: 1; font-size: 1rem; font-weight: 600; }
-        .rank-count { font-size: 1rem; font-weight: 700; }
+        .vs-name {
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+            margin-bottom: 8px;
+        }
 
-        .fun-stat { background: rgba(255,255,255,0.15); border-radius: 15px; padding: 20px 30px; margin: 15px; text-align: center; }
-        .fun-stat-value { font-size: 2rem; font-weight: 900; }
-        .fun-stat-label { font-size: 0.9rem; opacity: 0.8; margin-top: 5px; }
+        .vs-count {
+            font-size: 3.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(180deg, #fff 0%, rgba(255,255,255,0.8) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .vs-divider {
+            font-size: 1.25rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+        }
+
+        /* Leaderboard */
+        .leaderboard {
+            width: 100%;
+            max-width: 400px;
+            margin-top: 32px;
+        }
+
+        .leaderboard-item {
+            display: flex;
+            align-items: center;
+            padding: 14px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            animation: fadeUp 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+            opacity: 0;
+        }
+
+        .leaderboard-item:nth-child(1) { animation-delay: 0.05s; }
+        .leaderboard-item:nth-child(2) { animation-delay: 0.1s; }
+        .leaderboard-item:nth-child(3) { animation-delay: 0.15s; }
+        .leaderboard-item:nth-child(4) { animation-delay: 0.2s; }
+        .leaderboard-item:nth-child(5) { animation-delay: 0.25s; }
+        .leaderboard-item:nth-child(6) { animation-delay: 0.3s; }
+        .leaderboard-item:nth-child(7) { animation-delay: 0.35s; }
+        .leaderboard-item:nth-child(8) { animation-delay: 0.4s; }
+
+        .leaderboard-item:last-child { border-bottom: none; }
+
+        .rank {
+            font-size: 1.25rem;
+            width: 40px;
+            text-align: center;
+        }
+
+        .rank-name {
+            flex: 1;
+            font-size: 1rem;
+            font-weight: 500;
+            color: rgba(255,255,255,0.9);
+        }
+
+        .rank-count {
+            font-size: 0.9375rem;
+            font-weight: 600;
+            color: var(--apple-gray);
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Fun Stats */
+        .fun-stat {
+            background: rgba(255,255,255,0.06);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 24px 32px;
+            text-align: center;
+            min-width: 140px;
+        }
+
+        .fun-stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(180deg, #fff 0%, rgba(255,255,255,0.8) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .fun-stat-label {
+            font-size: 0.8125rem;
+            font-weight: 500;
+            color: var(--apple-gray);
+            margin-top: 6px;
+        }
+
+        /* Accent colors for variety */
+        .slide-total .big-number {
+            background: linear-gradient(180deg, #ff375f 0%, #ff6482 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+
+        .slide-daily .big-number {
+            background: linear-gradient(180deg, var(--apple-blue) 0%, #40a9ff 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+
+        .slide-peak .big-number {
+            background: linear-gradient(180deg, var(--apple-purple) 0%, #c77dff 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+
+        .slide-busiest .big-number {
+            background: linear-gradient(180deg, var(--apple-orange) 0%, #ffb340 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+
+        .slide-day .big-number {
+            background: linear-gradient(180deg, var(--apple-teal) 0%, #7dd3fc 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+
+        /* Remove emoji from titles for cleaner look */
+        .slide-leaderboard .title,
+        .slide-reactions .title,
+        .slide-late-night .title,
+        .slide-sweet .title,
+        .slide-random .title,
+        .slide-months .title,
+        .slide-stats .title {
+            -webkit-text-fill-color: white;
+        }
     </style>
 </head>
 <body>
     <div class="wrapped-container" onclick="nextSlide()">
 HTMLEOF
 
-# Determine intro emoji based on mode
+# Determine intro subtitle based on mode
 if [ "$MODE" = "all" ]; then
-    INTRO_EMOJI="📱"
-    INTRO_SUBTITLE="Your entire year of texts, wrapped up with a bow"
+    INTRO_SUBTITLE="Your entire year of messages, beautifully summarized."
 elif [ "$MODE" = "group" ]; then
-    INTRO_EMOJI="👥"
-    INTRO_SUBTITLE="A year of group chat chaos, condensed into stats"
+    INTRO_SUBTITLE="A year of conversations, captured in numbers."
 else
-    INTRO_EMOJI="💬"
-    INTRO_SUBTITLE="A year of texts, memories, and conversations"
+    INTRO_SUBTITLE="A year of connection, one message at a time."
 fi
 
 # Add slides
 cat >> "$OUTPUT_FILE" << EOF
         <!-- Slide 0: Intro -->
         <div class="slide slide-intro active" data-slide="0">
-            <div class="intro-logo">$INTRO_EMOJI</div>
+            <div class="pre-title">YEAR IN REVIEW</div>
             <div class="title">$TITLE</div>
-            <div class="pre-title">WRAPPED $YEAR</div>
+            <div class="stat-label">$YEAR</div>
             <div class="subtitle">$INTRO_SUBTITLE</div>
         </div>
 
         <!-- Slide 1: Total Messages -->
         <div class="slide slide-total" data-slide="1">
-            <div class="pre-title">This year, you exchanged...</div>
-            <div class="big-number glow">$(printf "%'d" $TOTAL_MESSAGES)</div>
+            <div class="pre-title">THIS YEAR YOU EXCHANGED</div>
+            <div class="big-number">$(printf "%'d" $TOTAL_MESSAGES)</div>
             <div class="stat-label">messages</div>
             <div class="subtitle">$TOTAL_COMMENT</div>
         </div>
@@ -991,9 +1543,48 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Leaderboard -->
         <div class="slide slide-leaderboard" data-slide="$SLIDE_NUM">
-            <div class="title">🏆 The Yappers 🏆</div>
-            <div class="pre-title">Who carried the conversation?</div>
+            <div class="pre-title">WHO TALKED THE MOST</div>
+            <div class="title">Top Messagers</div>
             $LEADERBOARD_HTML
+        </div>
+EOF
+SLIDE_NUM=$((SLIDE_NUM + 1))
+fi
+
+# Add laugh react leaderboard for group mode
+if [ "$MODE" = "group" ] && [ "$LAUGHED" -gt 0 ] && [ -n "$TOP_LAUGH_RECEIVERS" ]; then
+    # Build laugh leaderboard HTML
+    LAUGH_LEADERBOARD_HTML="<div class=\"leaderboard\">"
+    RANK=1
+    while IFS='|' read -r person count; do
+        if [ -n "$person" ]; then
+            if [ "$person" = "YOU" ]; then
+                NAME_HTML="<strong style=\"color: var(--apple-blue);\">You</strong>"
+            else
+                NAME=$(get_contact_name "$person")
+                NAME_HTML="$NAME"
+            fi
+
+            case $RANK in
+                1) MEDAL="🥇" ;;
+                2) MEDAL="🥈" ;;
+                3) MEDAL="🥉" ;;
+                *) MEDAL="&nbsp;&nbsp;" ;;
+            esac
+
+            LAUGH_LEADERBOARD_HTML="$LAUGH_LEADERBOARD_HTML<div class=\"leaderboard-item\"><span class=\"rank\">$MEDAL</span><span class=\"rank-name\">$NAME_HTML</span><span class=\"rank-count\">$count</span></div>"
+            ((RANK++))
+        fi
+    done <<< "$TOP_LAUGH_RECEIVERS"
+    LAUGH_LEADERBOARD_HTML="$LAUGH_LEADERBOARD_HTML</div>"
+
+cat >> "$OUTPUT_FILE" << EOF
+
+        <!-- Slide: Laugh React Leaderboard -->
+        <div class="slide slide-leaderboard" data-slide="$SLIDE_NUM">
+            <div class="pre-title">MOST LAUGH REACTS RECEIVED</div>
+            <div class="title">The Comedians</div>
+            $LAUGH_LEADERBOARD_HTML
         </div>
 EOF
 SLIDE_NUM=$((SLIDE_NUM + 1))
@@ -1005,8 +1596,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Balance -->
         <div class="slide slide-balance" data-slide="$SLIDE_NUM">
-            <div class="title">Who Texted More?</div>
-            <div class="pre-title">The message balance</div>
+            <div class="pre-title">MESSAGE BALANCE</div>
+            <div class="title">Who Texted More</div>
             <div class="balance-bar">
                 <div class="balance-you" style="width: ${YOUR_PERCENT}%">$YOUR_NAME: $(printf "%'d" $YOUR_MESSAGES)</div>
                 <div class="balance-them" style="width: ${THEIR_PERCENT}%">$CONTACT_NAME: $(printf "%'d" $THEIR_MESSAGES)</div>
@@ -1021,7 +1612,7 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Daily Average -->
         <div class="slide slide-daily" data-slide="$SLIDE_NUM">
-            <div class="pre-title">On average, that's...</div>
+            <div class="pre-title">DAILY AVERAGE</div>
             <div class="big-number">$DAILY_AVG</div>
             <div class="stat-label">messages per day</div>
             <div class="subtitle">$DAILY_COMMENT</div>
@@ -1033,9 +1624,9 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Peak Hour -->
         <div class="slide slide-peak" data-slide="$SLIDE_NUM">
-            <div class="pre-title">Your favorite time to talk...</div>
+            <div class="pre-title">PEAK MESSAGING HOUR</div>
             <div class="big-number">$PEAK_HOUR_FMT</div>
-            <div class="stat-label">$(printf "%'d" $PEAK_HOUR_COUNT) messages at this hour</div>
+            <div class="stat-label">$(printf "%'d" $PEAK_HOUR_COUNT) messages</div>
             <div class="subtitle">$PEAK_COMMENT</div>
         </div>
 EOF
@@ -1045,8 +1636,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Reactions -->
         <div class="slide slide-reactions" data-slide="$SLIDE_NUM">
-            <div class="title">Reaction Check</div>
-            <div class="pre-title">$(printf "%'d" $TOTAL_REACTIONS) reactions exchanged</div>
+            <div class="pre-title">$(printf "%'d" $TOTAL_REACTIONS) TOTAL REACTIONS</div>
+            <div class="title">Reactions</div>
             <div class="reactions-grid">
                 <div class="reaction-item"><span class="reaction-emoji">❤️</span><span class="reaction-count">$LOVED</span></div>
                 <div class="reaction-item"><span class="reaction-emoji">‼️</span><span class="reaction-count">$EMPHASIZED</span></div>
@@ -1064,8 +1655,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Late Night -->
         <div class="slide slide-late-night" data-slide="$SLIDE_NUM">
-            <div class="title">🌙 Night Owls 🌙</div>
-            <div class="pre-title">Messages sent between 1-5 AM</div>
+            <div class="pre-title">MESSAGES SENT 1–5 AM</div>
+            <div class="title">Night Owls</div>
             <div class="vs-container">
                 <div class="vs-person">
                     <div class="vs-name">$CONTACT_NAME</div>
@@ -1088,8 +1679,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Sweet Messages -->
         <div class="slide slide-sweet" data-slide="$SLIDE_NUM">
-            <div class="title">💕 The Sweet Stuff 💕</div>
-            <div class="pre-title">Messages that made hearts melt</div>
+            <div class="pre-title">HEARTFELT MOMENTS</div>
+            <div class="title">The Sweet Stuff</div>
             $SWEET_HTML
         </div>
 EOF
@@ -1102,8 +1693,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Random Moments -->
         <div class="slide slide-random" data-slide="$SLIDE_NUM">
-            <div class="title">💬 Random Moments 💬</div>
-            <div class="pre-title">Messages that capture the vibe</div>
+            <div class="pre-title">MEMORABLE MESSAGES</div>
+            <div class="title">Random Moments</div>
             $RANDOM_HTML
         </div>
 EOF
@@ -1114,9 +1705,9 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Busiest Day -->
         <div class="slide slide-busiest" data-slide="$SLIDE_NUM">
-            <div class="pre-title">Your most intense texting day...</div>
-            <div class="big-number" style="font-size: clamp(1.8rem, 7vw, 4rem);">$BUSIEST_DATE_FMT</div>
-            <div class="stat-label">$BUSIEST_COUNT messages in one day</div>
+            <div class="pre-title">BUSIEST DAY</div>
+            <div class="big-number" style="font-size: clamp(2rem, 8vw, 5rem);">$BUSIEST_DATE_FMT</div>
+            <div class="stat-label">$BUSIEST_COUNT messages</div>
             <div class="subtitle">$BUSIEST_COMMENT</div>
         </div>
 EOF
@@ -1126,12 +1717,12 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Monthly -->
         <div class="slide slide-months" data-slide="$SLIDE_NUM">
-            <div class="title">📈 Your Year in Motion</div>
-            <div class="pre-title">Messages by month</div>
+            <div class="pre-title">MESSAGES BY MONTH</div>
+            <div class="title">Your Year</div>
             <div class="chart-container">
                 $MONTH_BARS
             </div>
-            <div class="subtitle">$PEAK_MONTH_NAME was your peak month. The conversation ebbs and flows!</div>
+            <div class="subtitle">$PEAK_MONTH_NAME was your peak month.</div>
         </div>
 EOF
 SLIDE_NUM=$((SLIDE_NUM + 1))
@@ -1140,9 +1731,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Day of Week -->
         <div class="slide slide-day" data-slide="$SLIDE_NUM">
-            <div class="title">Your Day</div>
-            <div class="pre-title">Busiest day of the week</div>
-            <div class="big-number" style="font-size: clamp(2.5rem, 10vw, 6rem);">$BUSIEST_DAY_NAME</div>
+            <div class="pre-title">FAVORITE DAY TO TEXT</div>
+            <div class="big-number" style="font-size: clamp(2.5rem, 10vw, 5rem);">$BUSIEST_DAY_NAME</div>
             <div class="stat-label">$(printf "%'d" $BUSIEST_DOW_COUNT) messages</div>
             <div class="subtitle">$DOW_COMMENT</div>
         </div>
@@ -1154,7 +1744,8 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Fun Stats -->
         <div class="slide slide-stats" data-slide="$SLIDE_NUM">
-            <div class="title">📊 By The Numbers 📊</div>
+            <div class="pre-title">MORE STATS</div>
+            <div class="title">By the Numbers</div>
             <div class="stat-row">
                 <div class="fun-stat">
                     <div class="fun-stat-value">$(printf "%'d" $TOTAL_WORDS)</div>
@@ -1162,7 +1753,7 @@ cat >> "$OUTPUT_FILE" << EOF
                 </div>
                 <div class="fun-stat">
                     <div class="fun-stat-value">$(printf "%'d" $PHOTO_COUNT)</div>
-                    <div class="fun-stat-label">photos/videos</div>
+                    <div class="fun-stat-label">photos & videos</div>
                 </div>
                 <div class="fun-stat">
                     <div class="fun-stat-value">$TOTAL_LATE</div>
@@ -1178,9 +1769,9 @@ cat >> "$OUTPUT_FILE" << EOF
 
         <!-- Slide: Finale -->
         <div class="slide slide-finale" data-slide="$SLIDE_NUM">
-            <div class="intro-logo">$INTRO_EMOJI</div>
-            <div class="title">That's a Wrap!</div>
-            <div class="pre-title">$TITLE $YEAR</div>
+            <div class="pre-title">$TITLE</div>
+            <div class="title">That's a Wrap</div>
+            <div class="stat-label">$YEAR</div>
             <div class="stat-row">
                 <div class="mini-stat">
                     <div class="mini-stat-value">$(printf "%'d" $TOTAL_MESSAGES)</div>
@@ -1195,7 +1786,7 @@ cat >> "$OUTPUT_FILE" << EOF
                     <div class="mini-stat-label">days</div>
                 </div>
             </div>
-            <div class="subtitle" style="margin-top: 40px;">Here's to another year of conversations, reactions, and memories. See you in 2026! ✨</div>
+            <div class="subtitle" style="margin-top: 40px;">Here's to another year of conversations.</div>
         </div>
     </div>
 EOF
@@ -1218,11 +1809,11 @@ cat >> "$OUTPUT_FILE" << EOF
     </div>
 
     <div class="nav-arrows">
-        <button class="nav-arrow" onclick="prevSlide(event)">←</button>
-        <button class="nav-arrow" onclick="nextSlide(event)">→</button>
+        <button class="nav-arrow" onclick="prevSlide(event)">‹</button>
+        <button class="nav-arrow" onclick="nextSlide(event)">›</button>
     </div>
 
-    <div class="click-hint">Click anywhere or use arrows to continue →</div>
+    <div class="click-hint">Tap to continue</div>
 
     <script>
         let currentSlide = 0;
