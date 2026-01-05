@@ -903,7 +903,7 @@ cat > "$OUTPUT_FILE" << 'HTMLEOF'
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>💬 Wrapped</title>
+    <title>iMessage Wrapped</title>
     <style>
         :root {
             --apple-black: #1d1d1f;
