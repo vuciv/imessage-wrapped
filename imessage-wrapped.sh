@@ -602,7 +602,7 @@ fi
 SWEET_MESSAGES=$(sqlite3 "$IMESSAGE_DB" "
     SELECT
         m.is_from_me,
-        REPLACE(REPLACE(m.text, '\"', ''), \"'\", '')
+        REPLACE(REPLACE(m.text, '\"', ''), '''', '')
     $BASE_FROM
     WHERE $WHERE_CLAUSE
       AND m.text IS NOT NULL
@@ -615,7 +615,7 @@ SWEET_MESSAGES=$(sqlite3 "$IMESSAGE_DB" "
 RANDOM_MESSAGES=$(sqlite3 "$IMESSAGE_DB" "
     SELECT
         m.is_from_me,
-        REPLACE(REPLACE(m.text, '\"', ''), \"'\", '')
+        REPLACE(REPLACE(m.text, '\"', ''), '''', '')
     $BASE_FROM
     WHERE $WHERE_CLAUSE
       AND m.text IS NOT NULL
